@@ -41,6 +41,10 @@ const userSchema = new mongoose.Schema({
     storeName: {
       type: String,
       default: null,
+    },
+     refreshToken:{
+        type:String
+
     }
 },{timestamps:true})
 
@@ -70,7 +74,7 @@ userSchema.methods.accessToken =async function(){
     },process.env.ACCESS_TOKEN_SECRET,{expiresIn:process.env.ACCESS_TOKEN_EXPIRY})
 }
 
-userSchema.methods.refreshToken =async function(){
+userSchema.methods.generateRefreshToken =async function(){
    return await jwt.sign({
         id:this._id
       

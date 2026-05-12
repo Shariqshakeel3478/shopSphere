@@ -1,6 +1,8 @@
 import { User } from "../models/user.model.js";
 import { ApiError } from "../utils/apiError.js";
 import { ApiResponse } from "../utils/apiResponse.js";
+import jwt from 'jsonwebtoken'
+import { uploadOnCloudinary } from "../utils/cloudinary.utils.js";
 
 
 const generateAccessAndRefreshToken = async(userId)=>{
@@ -12,56 +14,80 @@ const generateAccessAndRefreshToken = async(userId)=>{
     }
 
     const accessToken =await user.accessToken();
-    const refreshToken = await user.refreshToken()
+    const refreshToken = await user.generateRefreshToken()
+
+    user.refreshToken = refreshToken 
+await user.save({validateBeforeSave:false})
 
     return {accessToken,refreshToken}
 
 }
 
 
-const registerUser = async(req,res)=>{
-    const {username,email,password,role,profileImage,phoneNumber,vendorName,storeName} = req.body
-    console.log("User data",req.body)
+const registerUser = async (req, res) => {
+    try {
+        const { username, email, password, role, phoneNumber, vendorName, storeName } = req.body;
 
-    if([username,email,password,role].some((field)=> field.trim()==="" || !phoneNumber)){
-        throw new ApiError(400,"All fields are required")
+        // 1. Validation (Check all required fields)
+        if (
+            [username, email, password, role, phoneNumber].some((field) => 
+                field?.toString().trim() === "" || field === undefined
+            )
+        ) {
+            throw new ApiError(400, "All fields are required");
+        }
+
+        // 2. Check if user already exists
+        const existedUser = await User.findOne({ $or: [{ username }, { email }] });
+        if (existedUser) {
+            throw new ApiError(400, "User with this email or username already exists");
+        }
+
+        // 3. Local File Path Check
+        const profileImagePath = req.file?.path;
+        if (!profileImagePath) {
+            throw new ApiError(400, "Profile image is required");
+        }
+
+        // 4. Cloudinary Upload
+        const profileImageUpload = await uploadOnCloudinary(profileImagePath);
+        
+        if (!profileImageUpload) {
+            throw new ApiError(400, "Failed to upload on Cloudinary. Please try again.");
+        }
+
+        // 5. Database Creation
+        const createUser = await User.create({
+            username,
+            email,
+            password,
+            role,
+            phoneNumber,
+            profileImage: profileImageUpload.url, // Cloudinary secure URL
+            vendorName,
+            storeName
+        });
+
+        // 6. Verification & Password Removal
+        const user = await User.findById(createUser._id).select("-password -refreshToken");
+
+        if (!user) {
+            throw new ApiError(500, "Something went wrong while registering the user");
+        }
+
+        // 7. Success Response
+        return res.status(201).json(
+            new ApiResponse(201, "User created Successfully", user)
+        );
+
+    } catch (error) {
+        // Error response handling
+        return res.status(error.statusCode || 500).json({
+            success: false,
+            message: error.message || "Internal Server Error"
+        });
     }
-
-    // check if user already exist
-    const existedUser = await User.findOne({
-        $or:[{username},{email}]
-    })
-
-    console.log("Existed User",existedUser)
-
-    if(existedUser){
-        throw new ApiError(400,"User with this email or username already exist")
-    }
-
-   const createUser =await User.create({
-        username,
-      email,
-        password,
-        role,
-        phoneNumber,
-       profileImage,
-        vendorName,
-        storeName
-    })
-
-    if(!createUser){
-        throw new ApiError(400,"Failed to create user")
-    }
-
-    // finding user on db
-
-    const user = await User.findById(createUser._id).select("-password -refreshToken")
-
-
-   return res.status(200).json(
-    new ApiResponse(200,"User created Successfully",user)
-   )
-}
+};
 
 
 const loginUser = async (req, res) => {
@@ -95,6 +121,7 @@ const loginUser = async (req, res) => {
         secure: true
     };
 
+    console.log(loggedInUser)
     return res
         .status(200)
         .cookie("accessToken", accessToken, options)
@@ -106,31 +133,80 @@ const loginUser = async (req, res) => {
                 refreshToken
             })
         );
+
+};
+
+const refreshAccessToken = async(req,res)=>{
+
+
+   const incomingRefreshToken = req.cookies.refreshToken;
+
+   if(!incomingRefreshToken){
+      throw new ApiError(400,"Unauthorized")
+   }
+
+  try {
+   const decodedToken =await jwt.verify(incomingRefreshToken,process.env.REFRESH_TOKEN_SECRET)
+
+  const user = await User.findById(decodedToken._id)
+
+  if(!user){
+   throw new ApiError(400,"Invalid Refresh Token")
+  }
+
+  if(incomingRefreshToken !== user.refreshToken){
+   throw new ApiError(400,"Refresh Token expired or used")
+  }
+
+  const {accessToken,refreshToken} =await generateAccessAndRefreshToken(user._id)
+
+  const options ={
+   httpOnly:true,
+   secure:true
+  }
+  res.status(200).cookie("Access Token",newAccessToken,options).cookie("Refresh Token",newRefreshToken,options).json(
+   new ApiResponse(200,{
+      newAccessToken,newRefreshToken
+   })
+  )
+
+ 
+
+  } catch (error) {
+   throw new ApiError(400,"Invalid Refresh Token")
+  }
+
+
 };
 
 
-const logoutUser = async(req,res)=>{
+const logoutUser = async (req, res) => {
 
-    const user =await User.findByIdAndUpdate(req.user.id,{
-        $set:{
-            refreshToken:undefined
-        }
-    })
+    if (!req.user) {
+        throw new ApiError(400, "Unauthorized");
+    }
 
-if(!req.user){
-    throw new ApiError(400,"Unauthorized")
-}
+    const user = await User.findByIdAndUpdate(
+        req.user._id,
+        {
+            $unset: { refreshToken: null }
+        },
+        { new: true }
+    );
 
-const options = {
-    httpOnly:true,
-    secure:true
-}
+    const options = {
+        httpOnly: true,
+        secure: true
+    };
 
-return res.status(200).clearCookie("accessToken",options).clearCookie("refreshToken",options).json(
-    new ApiResponse(200,"User loggedout")
-)
+    console.log("logged out user", user);
 
-   
-}
 
-export {registerUser,loginUser,logoutUser}
+    return res
+        .status(200)
+        .clearCookie("accessToken", options)
+        .clearCookie("refreshToken", options)
+        .json(new ApiResponse(200, "User logged out"));
+};
+
+export {registerUser,loginUser,logoutUser,refreshAccessToken}
